@@ -1,0 +1,12 @@
+node_modules
+.next
+data
+*.db
+*.db-journal
+.env
+.env.local
+npm-debug.log*
+.DS_Store
+
+# original single-file prototype this app was rebuilt from - kept locally for reference only
+officer-test-portal (6).html
