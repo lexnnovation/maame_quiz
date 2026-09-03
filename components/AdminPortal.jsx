@@ -28,6 +28,69 @@ async function sendJson(url, body, method = 'POST') {
   return { ok: res.ok, status: res.status, data };
 }
 
+function normalizeHeader(h) {
+  return String(h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+const IMPORT_HEADER_MAP = {
+  question: 'text',
+  questiontext: 'text',
+  text: 'text',
+  q: 'text',
+  a: 'optA',
+  optiona: 'optA',
+  answera: 'optA',
+  choicea: 'optA',
+  b: 'optB',
+  optionb: 'optB',
+  answerb: 'optB',
+  choiceb: 'optB',
+  c: 'optC',
+  optionc: 'optC',
+  answerc: 'optC',
+  choicec: 'optC',
+  d: 'optD',
+  optiond: 'optD',
+  answerd: 'optD',
+  choiced: 'optD',
+  correct: 'correct',
+  answer: 'correct',
+  correctanswer: 'correct',
+  correctoption: 'correct',
+  correctchoice: 'correct',
+  key: 'correct',
+};
+
+function resolveCorrectIndex(correctRaw, options) {
+  const v = String(correctRaw ?? '').trim();
+  if (!v) return -1;
+  if (/^[a-dA-D]$/.test(v)) return v.toUpperCase().charCodeAt(0) - 65;
+  // Prefer matching the literal option text (e.g. a numeric-answer question where
+  // "Correct" holds the answer itself, like "4") over treating a bare digit as a
+  // 1-based position — text match is the less ambiguous signal when it hits.
+  const textMatch = options.findIndex((o) => o.trim().toLowerCase() === v.toLowerCase());
+  if (textMatch !== -1) return textMatch;
+  if (/^[1-4]$/.test(v)) return parseInt(v, 10) - 1;
+  return -1;
+}
+
+function parseImportRows(rawRows) {
+  const questions = [];
+  rawRows.forEach((raw, i) => {
+    const mapped = {};
+    Object.keys(raw).forEach((key) => {
+      const target = IMPORT_HEADER_MAP[normalizeHeader(key)];
+      if (target) mapped[target] = raw[key];
+    });
+    const text = String(mapped.text || '').trim();
+    const options = [mapped.optA, mapped.optB, mapped.optC, mapped.optD].map((o) => String(o ?? '').trim());
+    if (!text && options.every((o) => !o)) return; // skip blank spreadsheet row
+    const correctIndex = resolveCorrectIndex(mapped.correct, options);
+    questions.push({ row: i + 2, text, options, correctIndex });
+  });
+  return questions;
+}
+
 function fmtTime(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -166,9 +229,52 @@ function OfficersTab({ officers, lastAdded, adminMsg, addingOfficer, nameRef, co
   );
 }
 
-function QuestionsTab({ questions, qTextRef, qOptRefs, qCorrectRef, onAdd, onDelete }) {
+function QuestionsTab({
+  questions,
+  qTextRef,
+  qOptRefs,
+  qCorrectRef,
+  onAdd,
+  onDelete,
+  fileInputRef,
+  importBusy,
+  importMsg,
+  importResult,
+  onImportFile,
+}) {
   return (
     <>
+      <div className="card">
+        <h2>
+          Bulk import <span className="tag">.xlsx or .csv</span>
+        </h2>
+        <p style={{ fontSize: '12px', color: 'var(--muted)' }}>
+          Columns: <strong>Question, A, B, C, D, Correct</strong> — Correct can be the letter A–D or the matching option text.
+        </p>
+        {importMsg && <div className="msg msg-error">{importMsg}</div>}
+        {importResult && (
+          <div className={importResult.errors.length ? 'msg msg-error' : 'msg msg-ok'}>
+            Imported {importResult.inserted} question{importResult.inserted === 1 ? '' : 's'}.
+            {importResult.errors.length > 0 && (
+              <>
+                {' '}
+                {importResult.errors.length} row{importResult.errors.length === 1 ? '' : 's'} skipped:
+                <ul style={{ margin: '6px 0 0 18px' }}>
+                  {importResult.errors.map((e, i) => (
+                    <li key={i}>
+                      Row {e.row}: {e.error}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </div>
+        )}
+        <input type="file" accept=".xlsx,.csv" ref={fileInputRef} onChange={onImportFile} disabled={importBusy} />
+        {importBusy && (
+          <p style={{ fontSize: '12px', color: 'var(--muted)', marginTop: '8px' }}>Importing&hellip;</p>
+        )}
+      </div>
       <div className="card">
         <h2>Add question</h2>
         <div className="field">
@@ -293,12 +399,16 @@ export default function AdminPortal() {
   const [adminMsg, setAdminMsg] = useState('');
   const [addingOfficer, setAddingOfficer] = useState(false);
   const [copiedCode, setCopiedCode] = useState('');
+  const [importBusy, setImportBusy] = useState(false);
+  const [importMsg, setImportMsg] = useState('');
+  const [importResult, setImportResult] = useState(null);
 
   const passRef = useRef(null);
   const nameRef = useRef(null);
   const qTextRef = useRef(null);
   const qOptRefs = [useRef(null), useRef(null), useRef(null), useRef(null)];
   const qCorrectRef = useRef(null);
+  const fileInputRef = useRef(null);
   const setTitleRef = useRef(null);
   const setQuarterRef = useRef(null);
   const setSecondsRef = useRef(null);
@@ -412,6 +522,52 @@ export default function AdminPortal() {
     if (q.ok) setQuestions(q.data.questions);
   }
 
+  async function onImportFile(e) {
+    const file = e.target.files?.[0];
+    if (e.target) e.target.value = '';
+    if (!file) return;
+
+    setImportMsg('');
+    setImportResult(null);
+
+    const name = file.name.toLowerCase();
+    if (!name.endsWith('.xlsx') && !name.endsWith('.csv')) {
+      setImportMsg('Only .xlsx and .csv files are supported.');
+      return;
+    }
+
+    setImportBusy(true);
+    let rawRows;
+    try {
+      const XLSX = await import('xlsx');
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    } catch (err) {
+      setImportBusy(false);
+      setImportMsg('Could not read that file — make sure it is a valid .xlsx or .csv.');
+      return;
+    }
+
+    const questions = parseImportRows(rawRows);
+    if (!questions.length) {
+      setImportBusy(false);
+      setImportMsg('No question rows found. Check the column headers (Question, A, B, C, D, Correct).');
+      return;
+    }
+
+    const { ok, data } = await sendJson('/api/admin/questions/bulk', { questions });
+    setImportBusy(false);
+    if (!ok) {
+      setImportMsg(data.error || 'Import failed.');
+      return;
+    }
+    setImportResult(data);
+    const q = await getJson('/api/admin/questions');
+    if (q.ok) setQuestions(q.data.questions);
+  }
+
   async function deleteQuestionById(id) {
     await sendJson(`/api/admin/questions/${id}`, {}, 'DELETE');
     const q = await getJson('/api/admin/questions');
@@ -512,6 +668,11 @@ export default function AdminPortal() {
           qCorrectRef={qCorrectRef}
           onAdd={addQuestion}
           onDelete={deleteQuestionById}
+          fileInputRef={fileInputRef}
+          importBusy={importBusy}
+          importMsg={importMsg}
+          importResult={importResult}
+          onImportFile={onImportFile}
         />
       )}
       {tab === 'settings' && settings && (
